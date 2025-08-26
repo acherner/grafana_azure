@@ -1,0 +1,50 @@
+You need 3 subnets in this setup because each plays a **different role** in making your Grafana + Postgres + Private Networking work reliably inside Azure. Azure enforces separation of concerns for certain PaaS features.
+
+---
+
+## 🔹 1. **App Service Integration Subnet (`s_appint`)**
+
+* Purpose: gives **Grafana App Service** outbound access **into your VNet**.
+* Without this, Grafana (which is multi-tenant PaaS) would only have a public egress path.
+* With VNet Integration, Grafana can:
+
+  * Reach your **Postgres Flexible Server** (in private subnet).
+  * Reach **Azure Monitor/Logs via AMPLS private endpoints**.
+  * Be inspected by your hub firewall/NVA if you enforce UDRs.
+* Limitation: you can’t host anything else in this subnet (only App Service integration tunnel).
+
+---
+
+## 🔹 2. **Private Endpoint Subnet (`s_pe`)**
+
+* Purpose: hosts **Private Endpoint NICs** for Grafana UI and AMPLS.
+* Each Private Endpoint = a NIC Azure injects into your VNet with a **private IP**.
+* Clients (your NOC laptops via VPN or peering) resolve `*.privatelink.azurewebsites.net` → this subnet’s private IP.
+* Azure requires PE subnets to have **network policies disabled** so you don’t break Azure’s control of those NICs.
+* Nothing else should be placed here besides PEs.
+
+---
+
+## 🔹 3. **Postgres Delegated Subnet (`s_pg`)**
+
+* Purpose: reserved for **PostgreSQL Flexible Server** when using **private access**.
+* Azure deploys the database’s underlying NICs here.
+* It must be **delegated** to `Microsoft.DBforPostgreSQL/flexibleServers`, otherwise Flexible Server won’t deploy.
+* This makes the DB accessible on a private IP, not public.
+* Nothing else can go in this subnet — it’s exclusive to the managed Postgres service.
+
+---
+
+## ✅ Why three instead of one?
+
+Because Azure has **different technical requirements**:
+
+* App Service Integration can’t share a subnet with PEs or delegated services.
+* Private Endpoints require network policies off, but Postgres needs delegation and normal policies.
+* Postgres needs its own delegated subnet; Azure won’t let you mix it with other resources.
+
+So it’s not “over-engineering” — it’s required by Azure’s design to keep PaaS networking predictable and secure.
+
+---
+
+👉 Want me to draw you a **simplified diagram with just the three subnets** and their exact purposes (UI ingress, App Service egress, DB private hosting), so it’s super clear how traffic flows between them?
