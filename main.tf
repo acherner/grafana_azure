@@ -359,7 +359,8 @@ resource "azurerm_linux_web_app" "grafana" {
   resource_group_name = azurerm_resource_group.rg.name
   service_plan_id     = azurerm_service_plan.plan.id
   https_only          = true
-  public_network_access_enabled = true
+  public_network_access_enabled = true #YOU CAN USE IT TO DEBUG AND ACCESS GRAFANA UI ON: https://app-grafana-l1.azurewebsites.net/
+  #public_network_access_enabled = false  
 
   identity { type = "SystemAssigned" }
 
@@ -371,6 +372,29 @@ resource "azurerm_linux_web_app" "grafana" {
       docker_image_name     = var.grafana_image #including tag like : appsvc/staticsite:latest
 
     }
+
+     # Add IP restrictions
+    ip_restriction {
+      ip_address = var.p2s_pool_cidr  # "172.16.201.0/24" 
+      name       = "AllowVPNClients"
+      priority   = 100
+      action     = "Allow"
+    }
+    
+    ip_restriction {
+      virtual_network_subnet_id = azurerm_subnet.s_pe.id
+      name                     = "AllowPrivateEndpointSubnet"
+      priority                 = 200
+      action                   = "Allow"
+    }
+
+    # Deny all other traffic
+    ip_restriction {
+      ip_address = "0.0.0.0/0"
+      name       = "DenyAll"
+      priority   = 2147483647
+      action     = "Deny"
+    }
   }
 
   # Persist data/provisioning/plugins under /home/grafana (Azure Files mount)
@@ -381,7 +405,8 @@ resource "azurerm_linux_web_app" "grafana" {
     account_name = azurerm_storage_account.sa.name
     access_key   = azurerm_storage_account.sa.primary_access_key
     share_name   = azurerm_storage_share.share.name
-    mount_path   = "/home/grafana"
+    mount_path   = "/var/lib/grafana"
+    #mount_path   = "/home/grafana"
   }
 
   app_settings = {
@@ -396,9 +421,16 @@ resource "azurerm_linux_web_app" "grafana" {
     "GF_DATABASE_SSL_MODE"   = "require"
 
     # Persist paths to Azure Files mount
-    "GF_PATHS_DATA"          = "/home/grafana/data"
-    "GF_PATHS_PLUGINS"       = "/home/grafana/plugins"
-    "GF_PATHS_PROVISIONING"  = "/home/grafana/provisioning"
+    # "GF_PATHS_DATA"          = "/home/grafana/data"
+    # "GF_PATHS_PLUGINS"       = "/home/grafana/plugins"
+    # "GF_PATHS_PROVISIONING"  = "/home/grafana/provisioning"
+
+    "GF_PATHS_DATA"          = "/var/lib/grafana/data"
+    "GF_PATHS_PLUGINS"       = "/var/lib/grafana/plugins"
+    "GF_PATHS_PROVISIONING"  = "/var/lib/grafana/provisioning"
+
+    # Add custom DNS server pointing to your private DNS resolver
+    "WEBSITE_DNS_SERVER" = "10.50.3.4"  # Your DNS resolver inbound IP
   }
 }
 
