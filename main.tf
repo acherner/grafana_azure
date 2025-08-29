@@ -290,6 +290,13 @@ resource "azurerm_postgresql_flexible_server" "pg" {
   private_dns_zone_id           = azurerm_private_dns_zone.pdz_postgres.id
   public_network_access_enabled = false
 
+  lifecycle {
+    ignore_changes = [
+      zone,
+      high_availability[0].standby_availability_zone
+    ]
+  }
+
   high_availability { mode = "ZoneRedundant" }
 }
 resource "azurerm_postgresql_flexible_server_database" "pgdb" {
@@ -352,6 +359,7 @@ resource "azurerm_linux_web_app" "grafana" {
   resource_group_name = azurerm_resource_group.rg.name
   service_plan_id     = azurerm_service_plan.plan.id
   https_only          = true
+  public_network_access_enabled = true
 
   identity { type = "SystemAssigned" }
 
@@ -383,7 +391,7 @@ resource "azurerm_linux_web_app" "grafana" {
     "GF_DATABASE_TYPE"       = "postgres"
     "GF_DATABASE_HOST"       = "${azurerm_postgresql_flexible_server.pg.fqdn}:5432"
     "GF_DATABASE_NAME"       = azurerm_postgresql_flexible_server_database.pgdb.name
-    "GF_DATABASE_USER"       = "${var.pg_admin_user}@${azurerm_postgresql_flexible_server.pg.name}"
+    "GF_DATABASE_USER"       = var.pg_admin_user  # Remove the @server part
     "GF_DATABASE_PASSWORD"   = random_password.pg_admin_pw.result
     "GF_DATABASE_SSL_MODE"   = "require"
 
