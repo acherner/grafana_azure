@@ -1,0 +1,8 @@
+to provide data sources create and edit file on Azure FIle share
+
+/provisioning/datasources/datasources.yaml
+
+
+grafana_mi_principal_id = "ba1db67f-8d90-4460-8ea4-be7783577977"
+grafana_private_fqdn = "app-grafana-l1.privatelink.azurewebsites.net"
+postgres_fqdn = "pg-grafana-l1.postgres.database.azure.com"

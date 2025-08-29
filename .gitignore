@@ -15,3 +15,5 @@ README.txt
 .terraform/providers/registry.terraform.io/hashicorp/local/2.5.3/windows_amd64/terraform-provider-local_v2.5.3_x5.exe
 .terraform/providers/registry.terraform.io/hashicorp/random/3.7.2/windows_amd64/LICENSE.txt
 .terraform/providers/registry.terraform.io/hashicorp/random/3.7.2/windows_amd64/terraform-provider-random_v3.7.2_x5.exe
+terraform.tfstate
+terraform.tfstate.backup

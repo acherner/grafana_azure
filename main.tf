@@ -1,7 +1,7 @@
 terraform {
   required_version = ">= 1.5.0"
   required_providers {
-    azurerm = { source = "hashicorp/azurerm", version = ">= 3.110.0" }
+    azurerm = { source = "hashicorp/azurerm", version = ">= 3.113.0" }
     random  = { source = "hashicorp/random",  version = ">= 3.5.1" }
     local   = { source = "hashicorp/local",   version = ">= 2.4.0" }
   }
@@ -33,7 +33,7 @@ variable "grafana_tag"         { default = "latest" }
 variable "pg_server_name"      { default = "pg-grafana-l1" }  # must be globally unique
 variable "pg_admin_user"       { default = "grafadmin" }
 variable "pg_version"          { default = "16" }
-variable "pg_sku_name"         { default = "GP_Standard_D2ds_v5" }
+variable "pg_sku_name"         { default = "GP_Standard_D2ds_v4" }
 
 # RBAC for Grafana MI
 #monitor_subscription_id → subscription ID where Grafana needs read access to metrics.
@@ -103,6 +103,17 @@ resource "azurerm_subnet" "s_appint" {
   resource_group_name  = azurerm_resource_group.rg.name
   virtual_network_name = azurerm_virtual_network.vnet.name
   address_prefixes     = [var.subnet_appint_cidr]
+
+  # REQUIRED for App Service Regional VNet Integration
+  delegation {
+    name = "delegation-appservice"
+    service_delegation {
+      name = "Microsoft.Web/serverFarms"
+      actions = [
+        "Microsoft.Network/virtualNetworks/subnets/action",
+      ]
+    }
+  }
 }
 
 # The Private Endpoint for Grafana Web App sits there, and its IP is what your DNS entry
@@ -158,6 +169,104 @@ resource "azurerm_private_dns_zone_virtual_network_link" "pdz_postgres_link" {
   private_dns_zone_name = azurerm_private_dns_zone.pdz_postgres.name
   virtual_network_id    = azurerm_virtual_network.vnet.id
 }
+
+# --- DNS Resolver Subnet (must be dedicated; /28 or larger) ---
+variable "subnet_dns_in_cidr" {
+  description = "CIDR for DNS Private Resolver inbound endpoint subnet"
+  type        = string
+  default     = "10.50.3.0/28"
+}
+
+# --- P2S VPN client pool (used for NSG rule) ---
+variable "p2s_pool_cidr" {
+  description = "P2S client address pool CIDR"
+  type        = string
+  default     = "172.16.201.0/24"
+}
+
+# Dedicated subnet for the inbound endpoint (no other resources)
+resource "azurerm_subnet" "s_dns_inbound" {
+  name                 = "snet-dns-inbound"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = [var.subnet_dns_in_cidr] # /28 or larger; dedicated
+
+  # REQUIRED for Private DNS Resolver endpoints
+  delegation {
+    name = "dnsresolver-delegation"
+    service_delegation {
+      name = "Microsoft.Network/dnsResolvers"
+      actions = [
+        "Microsoft.Network/virtualNetworks/subnets/join/action" #,
+        #Microsoft.Network/virtualNetworks/subnets/read",
+      ]
+    }
+  }
+}
+
+# resource "azurerm_network_security_group" "nsg_dns_inbound" {
+#   name                = "nsg-dns-inbound"
+#   location            = azurerm_resource_group.rg.location
+#   resource_group_name = azurerm_resource_group.rg.name
+
+#   security_rule {
+#     name                       = "Allow-DNS-UDP-from-P2S"
+#     priority                   = 100
+#     direction                  = "Inbound"
+#     access                     = "Allow"
+#     protocol                   = "Udp"
+#     source_port_range          = "*"
+#     destination_port_range     = "53"
+#     source_address_prefix      = var.p2s_pool_cidr
+#     destination_address_prefix = "*"
+#   }
+
+#   security_rule {
+#     name                       = "Allow-DNS-TCP-from-P2S"
+#     priority                   = 110
+#     direction                  = "Inbound"
+#     access                     = "Allow"
+#     protocol                   = "Tcp"
+#     source_port_range          = "*"
+#     destination_port_range     = "53"
+#     source_address_prefix      = var.p2s_pool_cidr
+#     destination_address_prefix = "*"
+#   }
+# }
+
+# resource "azurerm_subnet_network_security_group_association" "assoc_dns_inbound" {
+#   subnet_id                 = azurerm_subnet.s_dns_inbound.id
+#   network_security_group_id = azurerm_network_security_group.nsg_dns_inbound.id
+# }
+# The resolver resource bound to your hub VNet
+resource "azurerm_private_dns_resolver" "pdr" {
+  name                = "pdr-l1-hub"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  virtual_network_id  = azurerm_virtual_network.vnet.id
+}
+
+# Inbound endpoint (gives you one or more IPs to query from clients)
+resource "azurerm_private_dns_resolver_inbound_endpoint" "pdr_in" {
+  name                     = "pdr-inbound"
+  location                 = azurerm_resource_group.rg.location
+  private_dns_resolver_id  = azurerm_private_dns_resolver.pdr.id
+
+  ip_configurations {
+    private_ip_allocation_method = "Dynamic"
+    subnet_id                    = azurerm_subnet.s_dns_inbound.id
+  }
+}
+
+# Outputs (handy for NRPT / client config)
+output "dns_resolver_inbound_ips" {
+  description = "IP(s) of the DNS Private Resolver inbound endpoint"
+  value       = azurerm_private_dns_resolver_inbound_endpoint.pdr_in.ip_configurations[*].private_ip_address
+}
+
+
+
+
 
 ############################
 # Postgres Flexible Server (private)
@@ -224,48 +333,18 @@ resource "azurerm_storage_share" "share" {
 }
 
 # Directories for provisioning
-resource "azurerm_storage_share_directory" "dir_provisioning" {
-  name            = "provisioning"
-  storage_share_id = azurerm_storage_share.share.id
-}
+# DISABLED
+# known azurerm v3.x bug in azurerm_storage_share_directory where it mis-parses the File Share ARM ID and complains about the core.windows.net suffix
+# resource "azurerm_storage_share_directory" "dir_provisioning" {
+#   name            = "provisioning"
+#   storage_share_id = azurerm_storage_share.share.id
+# }
 
-resource "azurerm_storage_share_directory" "dir_datasources" {
-  name            = "provisioning/datasources"
-  storage_share_id = azurerm_storage_share.share.id
-}
+# resource "azurerm_storage_share_directory" "dir_datasources" {
+#   name            = "provisioning/datasources"
+#   storage_share_id = azurerm_storage_share.share.id
+# }
 
-# Build datasources.yaml via yamlencode, then upload to Azure Files
-locals {
-  gf_datasources = [
-    for ds in var.datasources : {
-      name     = ds.name
-      type     = "grafana-azure-monitor-datasource"
-      jsonData = {
-        cloudName       = "azuremonitor"
-        tenantId        = ds.tenant_id
-        subscriptionId  = ds.subscription_id
-        azureAuthType   = "msi"
-      }
-    }
-  ]
-  datasources_yaml = yamlencode({
-    apiVersion  = 1
-    datasources = local.gf_datasources
-  })
-}
-
-resource "local_file" "datasources_yaml" {
-  filename = "${path.module}/datasources.yaml"
-  content  = local.datasources_yaml
-}
-
-resource "azurerm_storage_share_file" "datasources_file" {
-  name             = "datasources.yaml"
-  storage_share_id = azurerm_storage_share.share.id
-  path             = "provisioning/datasources"
-  source           = local_file.datasources_yaml.filename
-  depends_on       = [azurerm_storage_share_directory.dir_datasources]
-}
 
 resource "azurerm_linux_web_app" "grafana" {
   name                = var.app_name
@@ -287,6 +366,7 @@ resource "azurerm_linux_web_app" "grafana" {
   }
 
   # Persist data/provisioning/plugins under /home/grafana (Azure Files mount)
+  # App Service mounts Azure File Share so Grafana can see provisioning/config files.
   storage_account {
     name         = "grafanafs"
     type         = "AzureFiles"
@@ -369,23 +449,32 @@ resource "azurerm_monitor_private_link_scoped_service" "ampls_ai" {
 
 # Private DNS for Azure Monitor (AMPLS)
 # NOTE: Azure Monitor uses several shared/global endpoints. Keep ONE AMPLS per DNS boundary.
+# When you use Azure Monitor Private Link Scope (AMPLS) and create a Private Endpoint for azuremonitor,
+# Azure needs to return private A records for a bunch of Azure Monitor/Logs/Application Insights hostnames. 
+# These zones host those private records. Without them, queries would still resolve to public endpoints and the traffic wouldn’t stay private.
 locals {
   monitor_private_zones = [
     "privatelink.monitor.azure.com",
     "privatelink.oms.opinsights.azure.com",
     "privatelink.ods.opinsights.azure.com",
-    "privatelink.agentsvc.azure-automation.net",
-    "privatelink.applicationinsights.azure.com",
-    "privatelink.profiler.applicationinsights.azure.com",
-    "privatelink.live.applicationinsights.azure.com",
+    # a Private DNS zone group on a single Private Endpoint can reference at most 5 zones
+    # so to use those it should be splitted to 2 PEs
+    # "privatelink.agentsvc.azure-automation.net",
+    # "privatelink.applicationinsights.azure.com",
+    # "privatelink.profiler.applicationinsights.azure.com",
+    # "privatelink.live.applicationinsights.azure.com",
   ]
 }
 
+# block creates the Private DNS zones for Azure Monitor’s Private Link and links them to your VNet so names like *.privatelink.monitor.azure.com resolve to private IPs inside your hub.
+# creates one Private DNS zone per name (loop via for_each).
 resource "azurerm_private_dns_zone" "pdz_monitor" {
   for_each            = toset(local.monitor_private_zones)
   name                = each.value
   resource_group_name = azurerm_resource_group.rg.name
 }
+
+# for each created zone, creates a VNet link to your hub VNet so VMs/App Service (via VNet integration) resolve those names to Private Endpoint IPs.
 resource "azurerm_private_dns_zone_virtual_network_link" "pdz_monitor_link" {
   for_each                = azurerm_private_dns_zone.pdz_monitor
   name                    = "link-${replace(each.value.name, ".", "-")}"
