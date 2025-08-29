@@ -27,7 +27,7 @@ variable "subnet_pg_cidr"      { default = "10.50.30.0/24" } # PostgreSQL delega
 variable "plan_name"           { default = "asp-grafana-p3v3" }
 variable "app_name"            { default = "app-grafana-l1" }
 variable "grafana_image"       { default = "grafana/grafana" }
-variable "grafana_tag"         { default = "latest" }
+variable "grafana_tag"         { default = "12.1.1" }
 
 # Postgres
 variable "pg_server_name"      { default = "pg-grafana-l1" }  # must be globally unique
@@ -352,6 +352,44 @@ resource "azurerm_storage_share" "share" {
 #   storage_share_id = azurerm_storage_share.share.id
 # }
 
+resource "azurerm_network_security_group" "nsg_grafana" {
+  name                = "nsg-grafana-pe"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  # Allow only VPN clients to reach private endpoint
+  security_rule {
+    name                       = "Allow-VPN-to-Grafana"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_ranges    = ["80", "443"]
+    source_address_prefix      = var.p2s_pool_cidr
+    destination_address_prefix = var.subnet_pe_cidr
+  }
+
+  # Deny all other inbound traffic
+  security_rule {
+    name                       = "Deny-All-Inbound"
+    priority                   = 4000
+    direction                  = "Inbound"
+    access                     = "Deny"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+}
+
+# Associate NSG with private endpoint subnet
+resource "azurerm_subnet_network_security_group_association" "nsg_pe_assoc" {
+  subnet_id                 = azurerm_subnet.s_pe.id
+  network_security_group_id = azurerm_network_security_group.nsg_grafana.id
+}
+
 
 resource "azurerm_linux_web_app" "grafana" {
   name                = var.app_name
@@ -369,9 +407,36 @@ resource "azurerm_linux_web_app" "grafana" {
     vnet_route_all_enabled = true
     ftps_state             = "Disabled"
     application_stack {
-      docker_image_name     = var.grafana_image #including tag like : appsvc/staticsite:latest
+      docker_registry_url   = "https://docker.io"
+      docker_image_name     = "${var.grafana_image}:${var.grafana_tag}" #including tag like : appsvc/staticsite:latest
 
     }
+
+    #  # Add IP restrictions
+    # ip_restriction {
+    #   ip_address = var.p2s_pool_cidr  # "172.16.201.0/24" 
+    #   name       = "AllowVPNClients"
+    #   priority   = 100
+    #   action     = "Allow"
+    # }
+    
+
+    # # Deny all other traffic
+    # ip_restriction {
+    #   ip_address = "0.0.0.0/0"
+    #   name       = "DenyAllOthers"
+    #   priority   = 2147483647
+    #   action     = "Deny"
+    # }
+
+    # # Add this - allow App Service to reach PostgreSQL
+    # ip_restriction {
+    #   virtual_network_subnet_id = azurerm_subnet.s_appint.id
+    #   name                     = "AllowAppServiceIntegration"
+    #   priority                 = 200
+    #   action                   = "Allow"
+    # }
+
 
      # Add IP restrictions
     ip_restriction {
@@ -431,6 +496,37 @@ resource "azurerm_linux_web_app" "grafana" {
 
     # Add custom DNS server pointing to your private DNS resolver
     "WEBSITE_DNS_SERVER" = "10.50.3.4"  # Your DNS resolver inbound IP
+
+    # ENHANCED SECURITY
+    # Additional security settings
+    "GF_SECURITY_DISABLE_GRAVATAR"           = "true"
+    "GF_SECURITY_STRICT_TRANSPORT_SECURITY"  = "true"
+    "GF_SECURITY_X_CONTENT_TYPE_OPTIONS"     = "true"
+    "GF_SECURITY_X_XSS_PROTECTION"          = "true"
+    "GF_SERVER_ROOT_URL"                     = "https://app-grafana-l1.azurewebsites.net/"
+  
+  }
+}
+
+# WAF Policy for additional protection
+resource "azurerm_web_application_firewall_policy" "grafana_waf" {
+  name                = "wafpol-grafana"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+
+  policy_settings {
+    enabled                     = true
+    mode                       = "Prevention"
+    request_body_check         = true
+    file_upload_limit_in_mb    = 100
+    max_request_body_size_in_kb = 128
+  }
+
+  managed_rules {
+    managed_rule_set {
+      type    = "OWASP"
+      version = "3.2"
+    }
   }
 }
 
