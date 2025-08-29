@@ -204,6 +204,26 @@ resource "azurerm_subnet" "s_dns_inbound" {
   }
 }
 
+# Subnet for DNS Resolver Outbound
+resource "azurerm_subnet" "s_dns_outbound" {
+  name                 = "snet-dns-outbound"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.50.4.0/24"]
+
+  delegation {
+    name = "delegation"
+
+    service_delegation {
+      name    = "Microsoft.Network/dnsResolvers"
+      actions = [
+        "Microsoft.Network/virtualNetworks/subnets/join/action",
+      ]
+    }
+  }
+}
+
+
 # resource "azurerm_network_security_group" "nsg_dns_inbound" {
 #   name                = "nsg-dns-inbound"
 #   location            = azurerm_resource_group.rg.location
@@ -240,13 +260,12 @@ resource "azurerm_subnet" "s_dns_inbound" {
 # }
 # The resolver resource bound to your hub VNet
 resource "azurerm_private_dns_resolver" "pdr" {
-  name                = "pdr-l1-hub"
-  resource_group_name = azurerm_resource_group.rg.name
+  name                = "dns-resolver"
   location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
   virtual_network_id  = azurerm_virtual_network.vnet.id
 }
 
-# Inbound endpoint (gives you one or more IPs to query from clients)
 resource "azurerm_private_dns_resolver_inbound_endpoint" "pdr_in" {
   name                     = "pdr-inbound"
   location                 = azurerm_resource_group.rg.location
@@ -257,6 +276,27 @@ resource "azurerm_private_dns_resolver_inbound_endpoint" "pdr_in" {
     subnet_id                    = azurerm_subnet.s_dns_inbound.id
   }
 }
+
+resource "azurerm_private_dns_resolver_outbound_endpoint" "pdr_out" {
+  name                     = "pdr-outbound"
+  location                 = azurerm_resource_group.rg.location
+  private_dns_resolver_id  = azurerm_private_dns_resolver.pdr.id
+  subnet_id                = azurerm_subnet.s_dns_outbound.id
+}
+
+resource "azurerm_private_dns_resolver_dns_forwarding_ruleset" "pdr_ruleset" {
+  name                = "dns-ruleset"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  private_dns_resolver_outbound_endpoint_ids = [azurerm_private_dns_resolver_outbound_endpoint.pdr_out.id]
+}
+
+resource "azurerm_private_dns_resolver_virtual_network_link" "pdr_link" {
+  name                      = "dns-link"
+  dns_forwarding_ruleset_id = azurerm_private_dns_resolver_dns_forwarding_ruleset.pdr_ruleset.id
+  virtual_network_id        = azurerm_virtual_network.vnet.id
+}
+
 
 # Outputs (handy for NRPT / client config)
 output "dns_resolver_inbound_ips" {
@@ -390,15 +430,15 @@ resource "azurerm_subnet_network_security_group_association" "nsg_pe_assoc" {
   network_security_group_id = azurerm_network_security_group.nsg_grafana.id
 }
 
-
 resource "azurerm_linux_web_app" "grafana" {
   name                = var.app_name
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   service_plan_id     = azurerm_service_plan.plan.id
   https_only          = true
-  public_network_access_enabled = true #YOU CAN USE IT TO DEBUG AND ACCESS GRAFANA UI ON: https://app-grafana-l1.azurewebsites.net/
-  #public_network_access_enabled = false  
+  #public_network_access_enabled = true #YOU CAN USE IT TO DEBUG AND ACCESS GRAFANA UI ON: https://app-grafana-l1.azurewebsites.net/
+  public_network_access_enabled = false  
+  virtual_network_subnet_id = azurerm_subnet.s_appint.id
 
   identity { type = "SystemAssigned" }
 
@@ -406,12 +446,18 @@ resource "azurerm_linux_web_app" "grafana" {
     always_on              = true
     vnet_route_all_enabled = true
     ftps_state             = "Disabled"
+
+    health_check_path = "/login" #"/api/health"
+    health_check_eviction_time_in_min = "2"
+    
     application_stack {
       docker_registry_url   = "https://docker.io"
       docker_image_name     = "${var.grafana_image}:${var.grafana_tag}" #including tag like : appsvc/staticsite:latest
 
     }
 
+
+    # ENABLE THOSE ONLY IF public_network_access_enabled = true
     #  # Add IP restrictions
     # ip_restriction {
     #   ip_address = var.p2s_pool_cidr  # "172.16.201.0/24" 
@@ -420,46 +466,20 @@ resource "azurerm_linux_web_app" "grafana" {
     #   action     = "Allow"
     # }
     
-
-    # # Deny all other traffic
     # ip_restriction {
-    #   ip_address = "0.0.0.0/0"
-    #   name       = "DenyAllOthers"
-    #   priority   = 2147483647
-    #   action     = "Deny"
-    # }
-
-    # # Add this - allow App Service to reach PostgreSQL
-    # ip_restriction {
-    #   virtual_network_subnet_id = azurerm_subnet.s_appint.id
-    #   name                     = "AllowAppServiceIntegration"
+    #   virtual_network_subnet_id = azurerm_subnet.s_pe.id
+    #   name                     = "AllowPrivateEndpointSubnet"
     #   priority                 = 200
     #   action                   = "Allow"
     # }
 
-
-     # Add IP restrictions
-    ip_restriction {
-      ip_address = var.p2s_pool_cidr  # "172.16.201.0/24" 
-      name       = "AllowVPNClients"
-      priority   = 100
-      action     = "Allow"
-    }
-    
-    ip_restriction {
-      virtual_network_subnet_id = azurerm_subnet.s_pe.id
-      name                     = "AllowPrivateEndpointSubnet"
-      priority                 = 200
-      action                   = "Allow"
-    }
-
-    # Deny all other traffic
-    ip_restriction {
-      ip_address = "0.0.0.0/0"
-      name       = "DenyAll"
-      priority   = 2147483647
-      action     = "Deny"
-    }
+    # # Deny all other traffic
+    # ip_restriction {
+    #   ip_address = "0.0.0.0/0"
+    #   name       = "DenyAll"
+    #   priority   = 2147483647
+    #   action     = "Deny"
+    # }
   }
 
   # Persist data/provisioning/plugins under /home/grafana (Azure Files mount)
@@ -663,7 +683,7 @@ resource "azurerm_role_assignment" "mi_law_reader" {
 # Outputs
 ############################
 output "grafana_private_fqdn" {
-  value       = "${var.app_name}.privatelink.azurewebsites.net"
+  value       = "${var.app_name}.azurewebsites.net"
   description = "Reach this FQDN from your VPN/VNet for Grafana UI"
 }
 output "postgres_fqdn" {
