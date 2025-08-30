@@ -12,6 +12,8 @@ provider "azurerm" {
   subscription_id = var.my_subscription_id
 }
 
+data "azurerm_client_config" "current" {}
+
 ############################
 # Variables (edit these)
 ############################
@@ -405,7 +407,7 @@ resource "azurerm_network_security_group" "nsg_grafana" {
     access                     = "Allow"
     protocol                   = "Tcp"
     source_port_range          = "*"
-    destination_port_ranges    = ["80", "443"]
+    destination_port_ranges    = ["443"]
     source_address_prefix      = var.p2s_pool_cidr
     destination_address_prefix = var.subnet_pe_cidr
   }
@@ -430,6 +432,70 @@ resource "azurerm_subnet_network_security_group_association" "nsg_pe_assoc" {
   network_security_group_id = azurerm_network_security_group.nsg_grafana.id
 }
 
+
+
+# Key Vault to store Grafana admin password
+resource "azurerm_key_vault" "kv" {
+  name                = "kv-${var.app_name}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  sku_name            = "standard"
+
+  access_policy {
+    # FOR TESTING - your user
+    tenant_id = data.azurerm_client_config.current.tenant_id
+    object_id = data.azurerm_client_config.current.object_id
+
+    #FOR PRODUCTION - Grafana MI
+    #tenant_id    = "<your_tenant_id>"
+    #object_id    = "<spn_object_id>"
+
+    secret_permissions = [
+      "Get",
+      "List",
+      "Set",
+      "Delete",
+    ]
+  }
+
+}
+
+resource "random_password" "grafana" {
+  length           = 20
+  special          = true
+  override_special = "!@#%^&*()-_=+[]{}" # optional, makes it stronger
+}
+
+resource "azurerm_key_vault_secret" "grafana_admin_pass" {
+  name         = "grafana-admin-password"
+  value        = random_password.grafana.result
+  key_vault_id = azurerm_key_vault.kv.id
+}
+
+# allows grafana to read passwords from Key Vault
+resource "azurerm_key_vault_access_policy" "grafana_webapp_policy" {
+  key_vault_id = azurerm_key_vault.kv.id
+  tenant_id    = data.azurerm_client_config.current.tenant_id
+  object_id    = azurerm_linux_web_app.grafana.identity[0].principal_id
+
+  secret_permissions = ["Get", "List"]
+}
+
+resource "random_password" "pg_admin_pw" {
+  length           = 20
+  special          = true
+  override_special = "!@#%^&*()-_=+[]{}"
+}
+
+resource "azurerm_key_vault_secret" "pg_admin_pass" {
+  name         = "pg-admin-password"
+  value        = random_password.pg_admin_pw.result
+  key_vault_id = azurerm_key_vault.kv.id
+}
+
+#Key Vault END
+
 resource "azurerm_linux_web_app" "grafana" {
   name                = var.app_name
   location            = azurerm_resource_group.rg.location
@@ -449,6 +515,8 @@ resource "azurerm_linux_web_app" "grafana" {
 
     health_check_path = "/login" #"/api/health"
     health_check_eviction_time_in_min = "2"
+
+    
     
     application_stack {
       docker_registry_url   = "https://docker.io"
@@ -480,6 +548,27 @@ resource "azurerm_linux_web_app" "grafana" {
     #   priority   = 2147483647
     #   action     = "Deny"
     # }
+
+    # SCM (Kudu) site restrictions
+    # those restrictions doesn't work when grafan aexposed over private IPs, but will work when exposed publicly
+    # https://app-grafana-l1.scm.azurewebsites.net/
+    scm_ip_restriction {
+      name      = "Deny-All-SCM"
+      ip_address = "0.0.0.0/0"
+      action     = "Deny"
+      priority   = 100
+      
+    }
+
+    scm_ip_restriction {
+      name      = "Allow-NOC-VPN"
+      ip_address = var.p2s_pool_cidr
+      action     = "Allow"
+      priority   = 100
+    }
+    # SCM (Kudu) site restrictions END
+
+
   }
 
   # Persist data/provisioning/plugins under /home/grafana (Azure Files mount)
@@ -495,7 +584,7 @@ resource "azurerm_linux_web_app" "grafana" {
   }
 
   app_settings = {
-    "GF_SECURITY_ADMIN_PASSWORD" = random_password.grafana_admin_pw.result
+    "GF_SECURITY_ADMIN_PASSWORD" = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault_secret.grafana_admin_pass.id})"
 
     # DB (Postgres)
     "GF_DATABASE_TYPE"       = "postgres"
@@ -522,11 +611,24 @@ resource "azurerm_linux_web_app" "grafana" {
     "GF_SECURITY_DISABLE_GRAVATAR"           = "true"
     "GF_SECURITY_STRICT_TRANSPORT_SECURITY"  = "true"
     "GF_SECURITY_X_CONTENT_TYPE_OPTIONS"     = "true"
-    "GF_SECURITY_X_XSS_PROTECTION"          = "true"
-    "GF_SERVER_ROOT_URL"                     = "https://app-grafana-l1.azurewebsites.net/"
+    "GF_SECURITY_X_XSS_PROTECTION"           = "true"
+    #"GF_SERVER_ROOT_URL"                     = "https://app-grafana-l1.azurewebsites.net/"
+
+    #"GF_SERVER_ROOT_URL"                     = "https://app-grafana-l1.privatelink.azurewebsites.net/"
+
+
+    "WEBSITE_DISABLE_SCM_SEPARATION" = "true"
+    "WEBSITE_RUN_FROM_PACKAGE"       = "1"
   
   }
 }
+
+# Disable basic authentication for the SCM site
+# resource "azurerm_app_service_basic_publishing_credentials_policy_scm" "example" {
+#   app_service_id = azurerm_linux_web_app.grafana.id
+#   enabled        = false
+# }
+
 
 # WAF Policy for additional protection
 resource "azurerm_web_application_firewall_policy" "grafana_waf" {
@@ -691,4 +793,9 @@ output "postgres_fqdn" {
 }
 output "grafana_mi_principal_id" {
   value = azurerm_linux_web_app.grafana.identity[0].principal_id
+}
+
+output "grafana_admin_password" {
+  value     = random_password.grafana.result
+  sensitive = true
 }
